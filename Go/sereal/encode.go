@@ -9,8 +9,6 @@ import (
 	"reflect"
 	"runtime"
 	"unsafe"
-
-	"code.google.com/p/snappy-go/snappy"
 )
 
 func reflectValueOf(v interface{}) reflect.Value {
@@ -23,66 +21,44 @@ func reflectValueOf(v interface{}) reflect.Value {
 
 }
 
-func snappify(b []byte) ([]byte, error) {
-	b[4] |= (2 << 4) // set the document type to '2' (incr snappy)
-
-	optHeaderLength, optHeaderSize := varintdecode(b[5:])
-	optHeaderLength += optHeaderSize
-
-	// XXX this could be more efficient!  I'm creating a new buffer to
-	//     store the compressed document, which isn't necessary.  You
-	//     could probably write directly to the slice after the header
-	//     and after the varint holding the length
-	compressed, err := snappy.Encode(nil, b[5+optHeaderLength:])
-	if err != nil {
-		return nil, err
-	}
-
-	// resize b to just the original header
-	b = b[:5+optHeaderLength]
-	b = varint(b, uint(len(compressed)))
-	b = append(b, compressed...)
-
-	return b, nil
-}
-
 // An Encoder encodes Go data structures into Sereal byte streams
 type Encoder struct {
-	PerlCompat      bool // try to mimic Perl's structure as much as possible
-	UseSnappy       bool // should we enable snappy compression
-	SnappyThreshold int  // threshold in bytes above which snappy compression is attempted: 1024 bytes by default
-	DisableDedup    bool // should we disable deduping of class names and hash keys
-	DisableFREEZE   bool // should we disable the FREEZE tag, which calls MarshalBinary
-	version         int  // default version to encode
+	PerlCompat           bool       // try to mimic Perl's structure as much as possible
+	Compression          compressor // optionally compress the main payload of the document using SnappyCompressor or ZlibCompressor
+	CompressionThreshold int        // threshold in bytes above which compression is attempted: 1024 bytes by default
+	DisableDedup         bool       // should we disable deduping of class names and hash keys
+	DisableFREEZE        bool       // should we disable the FREEZE tag, which calls MarshalBinary
+	version              int        // default version to encode
+}
+
+type compressor interface {
+	compress(b []byte) ([]byte, error)
 }
 
 // NewEncoder returns a new Encoder struct with default values
 func NewEncoder() *Encoder {
 	return &Encoder{
-		PerlCompat:      false,
-		UseSnappy:       false,
-		SnappyThreshold: 1024,
-		version:         1,
+		PerlCompat:           false,
+		CompressionThreshold: 1024,
+		version:              1,
 	}
 }
 
 // NewEncoderV2 returns a new Encoder that encodes version 2
 func NewEncoderV2() *Encoder {
 	return &Encoder{
-		PerlCompat:      false,
-		UseSnappy:       false,
-		SnappyThreshold: 1024,
-		version:         2,
+		PerlCompat:           false,
+		CompressionThreshold: 1024,
+		version:              2,
 	}
 }
 
 // NewEncoderV3 returns a new Encoder that encodes version 3
 func NewEncoderV3() *Encoder {
 	return &Encoder{
-		PerlCompat:      false,
-		UseSnappy:       false,
-		SnappyThreshold: 1024,
-		version:         3,
+		PerlCompat:           false,
+		CompressionThreshold: 1024,
+		version:              3,
 	}
 }
 
@@ -124,16 +100,39 @@ func (e *Encoder) MarshalWithHeader(header interface{}, body interface{}) (b []b
 		return nil, fmt.Errorf("protocol version '%v' not yet supported", e.version)
 	}
 
-	b = make([]byte, headerSize, 32)
+	encHeader := make([]byte, headerSize, 32)
 
 	if e.version < 3 {
-		binary.LittleEndian.PutUint32(b[:4], magicHeaderBytes)
+		binary.LittleEndian.PutUint32(encHeader[:4], magicHeaderBytes)
 	} else {
-		binary.LittleEndian.PutUint32(b[:4], magicHeaderBytesHighBit)
+		binary.LittleEndian.PutUint32(encHeader[:4], magicHeaderBytesHighBit)
 	}
 
-	// TODO(mvuets) Why document type isn't set?
-	b[4] = byte(e.version)
+	// Set the <version-type> component in the header
+	var doctype documentType
+	switch c := e.Compression.(type) {
+	case nil:
+		doctype = serealRaw
+	case SnappyCompressor:
+		if e.version > 1 && !c.Incremental {
+			return nil, errors.New("non-incremental snappy compression only valid for v1 documents")
+		}
+		doctype = serealSnappyIncremental
+	case ZlibCompressor:
+		if e.version < 3 {
+			return nil, errors.New("zlib compression only valid for v3 documents and up")
+		}
+		doctype = serealZlib
+	default:
+		// Defensive programming: this point should never be
+		// reached in production code because the compressor
+		// interface is not exported, hence no way to pass in
+		// an unknown thing. But it may happen during
+		// development when a new compressor is implemented,
+		// but a relevant document type is not defined.
+		panic("undefined compression")
+	}
+	encHeader[4] = byte(e.version) | byte(doctype)<<4
 
 	if header != nil && e.version >= 2 {
 		strTable := make(map[string]int)
@@ -141,17 +140,17 @@ func (e *Encoder) MarshalWithHeader(header interface{}, body interface{}) (b []b
 		rv := reflectValueOf(header)
 		// this is both the flag byte (== "there is user data") and also a hack to make 1-based offsets work
 		henv := []byte{0x01} // flag byte == "there is user data"
-		encoded, err := e.encode(henv, rv, false, strTable, ptrTable)
+		encHeaderSuffix, err := e.encode(henv, rv, false, strTable, ptrTable)
 
 		if err != nil {
 			return nil, err
 		}
 
-		b = varint(b, uint(len(encoded)))
-		b = append(b, encoded...)
+		encHeader = varint(encHeader, uint(len(encHeaderSuffix)))
+		encHeader = append(encHeader, encHeaderSuffix...)
 	} else {
 		/* header size */
-		b = append(b, 0)
+		encHeader = append(encHeader, 0)
 	}
 
 	rv := reflectValueOf(body)
@@ -159,31 +158,29 @@ func (e *Encoder) MarshalWithHeader(header interface{}, body interface{}) (b []b
 	strTable := make(map[string]int)
 	ptrTable := make(map[uintptr]int)
 
-	var encoded []byte
+	var encBody []byte
 
 	switch e.version {
 	case 1:
-		encoded, err = e.encode(b, rv, false, strTable, ptrTable)
+		encBody, err = e.encode(encBody, rv, false, strTable, ptrTable)
 	case 2, 3:
-		benc := []byte{0} // hack for 1-based offsets
-		encoded, err = e.encode(benc, rv, false, strTable, ptrTable)
-		encoded = encoded[1:] // trim hacky first byte
-		encoded = append(b, encoded...)
+		encBody = append(encBody, 0) // hack for 1-based offsets
+		encBody, err = e.encode(encBody, rv, false, strTable, ptrTable)
+		encBody = encBody[1:] // trim hacky first byte
 	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	if e.UseSnappy && (e.SnappyThreshold == 0 || len(encoded) >= e.SnappyThreshold) {
-		encoded, err = snappify(encoded)
-
+	if e.Compression != nil && (e.CompressionThreshold == 0 || len(encBody) >= e.CompressionThreshold) {
+		encBody, err = e.Compression.compress(encBody)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return encoded, nil
+	return append(encHeader, encBody...), nil
 }
 
 func (e *Encoder) encode(b []byte, rv reflect.Value, isKeyOrClass bool, strTable map[string]int, ptrTable map[uintptr]int) ([]byte, error) {

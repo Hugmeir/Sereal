@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	"code.google.com/p/snappy-go/snappy"
 )
 
 type serealHeader struct {
@@ -61,6 +59,10 @@ func readHeader(b []byte) (serealHeader, error) {
 type Decoder struct {
 	PerlCompat bool
 	copyDepth  int
+}
+
+type decompressor interface {
+	decompress(b []byte) ([]byte, error)
 }
 
 // NewDecoder returns a decoder with default flags
@@ -120,46 +122,43 @@ func (d *Decoder) UnmarshalHeaderBody(b []byte, vheader interface{}, vbody inter
 		return fmt.Errorf("document version '%d' not yet supported", header.version)
 	}
 
-	/* XXX instead of creating an uncompressed copy of the document,
-	 *     it would be more flexible to use a sort of "Reader" interface */
-	switch header.doctype {
+	var decomp decompressor
 
+	switch header.doctype {
 	case serealRaw:
 		// nothing
-	case serealSnappy:
 
+	case serealSnappy:
 		if header.version != 1 {
 			return errors.New("snappy compression only valid for v1 documents")
 		}
+		decomp = SnappyCompressor{Incremental: false}
 
-		decoded, err := snappy.Decode(nil, b[bodyStart:])
+	case serealSnappyIncremental:
+		decomp = SnappyCompressor{Incremental: true}
 
-		if err != nil {
-			return err
+	case serealZlib:
+		if header.version < 3 {
+			return errors.New("zlib compression only valid for v3 documents and up")
 		}
-
-		d := make([]byte, 0, len(decoded)+bodyStart)
-		d = append(d, b[:bodyStart]...)
-		d = append(d, decoded...)
-		b = d
-
-	case serealSnappyLength:
-		ln, sz := varintdecode(b[bodyStart:])
-		decoded, err := snappy.Decode(nil, b[bodyStart+sz:bodyStart+sz+ln])
-
-		if err != nil {
-			return err
-		}
-
-		// we want to treat the passed-in buffer as read-only here
-		// if we just used append, we'd overwrite any data past the end of the underlying array, which wouldn't be nice
-		d := make([]byte, 0, len(decoded)+bodyStart)
-		d = append(d, b[:bodyStart]...)
-		d = append(d, decoded...)
-		b = d
+		decomp = ZlibCompressor{}
 
 	default:
 		return fmt.Errorf("document type '%d' not yet supported", header.doctype)
+	}
+
+	/* XXX instead of creating an uncompressed copy of the document,
+	 *     it would be more flexible to use a sort of "Reader" interface */
+	if decomp != nil {
+		decompBody, err := decomp.decompress(b[bodyStart:])
+		if err != nil {
+			return err
+		}
+
+		// shrink down b to reuse the allocated buffer
+		b = b[:0]
+		b = append(b, b[:bodyStart]...)
+		b = append(b, decompBody...)
 	}
 
 	if vheader != nil && header.suffixSize != 1 {
